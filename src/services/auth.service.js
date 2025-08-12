@@ -4,7 +4,7 @@ import User from '../models/user.model.js';
 
 export const registerUser = async ({ name, email, password }) => {
   const existing = await User.findOne({ email });
-  if (existing) return null;
+  if (existing) return ;
 
   const hashedPassword = await bcrypt.hash(password, 10);
   const user = new User({ name, email, password: hashedPassword });
