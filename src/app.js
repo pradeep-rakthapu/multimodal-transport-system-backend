@@ -19,6 +19,7 @@ app.use(cors({
     if (process.env.ALLOWED_URL.indexOf(origin) !== -1) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
+  methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: true
 }));
 app.use(bodyParser.urlencoded({ extended: true }));
