@@ -12,7 +12,15 @@ import razorpayRoutes from './routes/razorpay.route.js';
 dotenv.config();
 
 const app = express();
-app.use(cors());
+
+app.use(cors({
+    origin: (origin, cb) => {
+    if (!origin) return cb(null, true); 
+    if (process.env.ALLOWED_URL.indexOf(origin) !== -1) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+}));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(session({

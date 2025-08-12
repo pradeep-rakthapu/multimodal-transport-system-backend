@@ -213,7 +213,6 @@ export function searchMetroStopsService(query) {
 
 export async function bookMetroTickets(data) {
       const mode = 'metro';
-      console.log(data);
       const source_stop_id = data.source_stop_id;
       const destination_stop_id = data.destination_stop_id;
       const source_route = data.source_route;
@@ -268,47 +267,79 @@ export async function bookMetroTickets(data) {
 };
 
 export const getMetroTickets = async (userId) => {
-   const groups = await Ticket.aggregate([
-    
-    {
-      $addFields: {
-        date: {
-          $dateToString: {
-            format: '%Y-%m-%d',
-            date: '$issued_at'
-          }
+  const modeFilter = 'metro'; 
+
+const pipeline = [
+
+  {
+    $match: {
+      mode: { $regex: `^${modeFilter}$`, $options: 'i' },
+      issued_at: { $exists: true, $ne: null },
+      expiry: { $exists: true, $ne: null } 
+    }
+  },
+
+
+  {
+    $addFields: {
+      date: { $dateToString: { format: '%Y-%m-%d', date: '$issued_at' } },
+      isValid: {
+        $cond: {
+          if: { $gt: ["$expiry", "$$NOW"] },
+          then: 1,
+          else: 0
         }
       }
-    },
-    {
-      $group: {
-        _id: {
-          source:      '$source_stop_name',
-          destination: '$destination_stop_name',
-          date:        '$date'
-        },
-        ticketCount: { $sum: 1 },
-        totalFare:   { $sum: '$fare' }
-      }
-    },
-    {
-      $sort: {
-        '_id.date':            1,
-        '_id.source':          1,
-        '_id.destination':     1
-      }
-    },
-    {
-      $project: {
-        _id:                    0,
-        source_stop_name:       '$_id.source',
-        destination_stop_name:  '$_id.destination',
-        date:                   '$_id.date',
-        ticketCount:            1,
-        totalFare:              1
-      }
     }
-  ]);
+  },
 
-  return groups;
+
+  {
+    $group: {
+      _id: {
+        source: '$source_stop_name',
+        destination: '$destination_stop_name',
+        date: '$date'
+      },
+      ticketCount: { $sum: 1 },
+      totalFare: { $sum: '$fare' },
+      maxExpiry: { $max: '$expiry' },
+      validCount: { $sum: '$isValid' }
+    }
+  },
+
+
+  {
+    $project: {
+      _id: 0,
+      source_stop_name: '$_id.source',
+      destination_stop_name: '$_id.destination',
+      date: '$_id.date',
+      ticketCount: 1,
+      totalFare: 1,
+      maxExpiry: 1,
+      validCount: 1,
+      expiryValid: { $gt: ["$maxExpiry", "$$NOW"] }
+    }
+  },
+
+  {
+    $sort: {
+      date: 1,
+      source_stop_name: 1,
+      destination_stop_name: 1
+    }
+  }
+];
+
+const groups = await Ticket.aggregate(pipeline);
+const filtered = [];
+groups.forEach(group => {
+
+  if (group.expiryValid === true || (group.validCount && group.validCount > 0)) {
+    filtered.push(group);
+  }
+});
+
+  return filtered;
 }

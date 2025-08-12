@@ -124,169 +124,303 @@ import _ from 'lodash';
 import Ticket from '../models/ticket.model.js';
 import { ObjectId } from 'mongodb';
 
-export default async function getShortestAndAlternatePaths(sourceStopId, destinationStopId, maxRoutes = 3) {
+export default async function getShortestAndAlternatePaths(
+  sourceStopId,
+  destinationStopId,
+  maxRoutes = 3,
+  maxDepth = 300
+) {
   sourceStopId = Number(sourceStopId);
   destinationStopId = Number(destinationStopId);
 
-  const [routes, stops] = await Promise.all([
-    Route.find({}),
-    Stop.find({})
-  ]);
+  const [routes, stops] = await Promise.all([Route.find({}), Stop.find({})]);
+  const stopMap = Object.fromEntries(stops.map((s) => [s.stop_id, s]));
 
-  const stopMap = Object.fromEntries(stops.map(s => [s.stop_id, s]));
-  
-  
+  // build adjacency
   const graph = {};
-  stops.forEach(s => { graph[s.stop_id] = []; });
-  const directrouteIds = [];
+  stops.forEach((s) => (graph[s.stop_id] = []));
+  const directRouteObjects = [];
 
-  routes.forEach(route => {
-    if(route.stopIds.includes(sourceStopId) && route.stopIds.includes(destinationStopId)){
-      directrouteIds.push(route);
+  for (const route of routes) {
+    const stopIds = route.stopIds || [];
+    if (stopIds.includes(sourceStopId) && stopIds.includes(destinationStopId)) {
+      directRouteObjects.push(route);
     }
-    
-    const stopIds = route.stopIds;
     for (let i = 0; i < stopIds.length - 1; i++) {
-      const a = stopIds[i], b = stopIds[i+1];
+      const a = stopIds[i],
+        b = stopIds[i + 1];
       if (graph[a] && graph[b]) {
-        graph[a].push({
-          stopId: b,
-          routeId: route.route_id,
-          routeName: route.route
-        });
-        graph[b].push({
-          stopId: a,
-          routeId: route.route_id,
-          routeName: route.route
-        });
+        graph[a].push({ stopId: b, routeId: route.route_id, routeName: route.route });
+        graph[b].push({ stopId: a, routeId: route.route_id, routeName: route.route });
       }
     }
-  });
+  }
 
-  const queue = new TinyQueue([], (a, b) => a.path.length - b.path.length);
-  const visited = new Set();
+  // minimal binary heap
+  class MinHeap {
+    constructor(compare) {
+      this.arr = [];
+      this.compare = compare;
+    }
+    push(x) {
+      this.arr.push(x);
+      this._up(this.arr.length - 1);
+    }
+    pop() {
+      if (!this.arr.length) return undefined;
+      const top = this.arr[0];
+      const last = this.arr.pop();
+      if (this.arr.length) {
+        this.arr[0] = last;
+        this._down(0);
+      }
+      return top;
+    }
+    size() {
+      return this.arr.length;
+    }
+    _up(i) {
+      const { arr, compare } = this;
+      let idx = i;
+      const item = arr[idx];
+      while (idx > 0) {
+        const p = Math.floor((idx - 1) / 2);
+        if (compare(item, arr[p]) < 0) {
+          arr[idx] = arr[p];
+          idx = p;
+        } else break;
+      }
+      arr[idx] = item;
+    }
+    _down(i) {
+      const { arr, compare } = this;
+      const n = arr.length;
+      let idx = i;
+      const item = arr[idx];
+      while (true) {
+        let l = 2 * idx + 1;
+        let r = l + 1;
+        let smallest = idx;
+        if (l < n && compare(arr[l], arr[smallest]) < 0) smallest = l;
+        if (r < n && compare(arr[r], arr[smallest]) < 0) smallest = r;
+        if (smallest === idx) break;
+        arr[idx] = arr[smallest];
+        idx = smallest;
+      }
+      arr[idx] = item;
+    }
+  }
+
+  // comparator: lexicographic (interchanges, pathLength)
+  // Note: node.interchanges is numeric (fewest transfers), node.path.length measures traversed length
+  const cmp = (a, b) => {
+    if (a.interchanges !== b.interchanges) return a.interchanges - b.interchanges;
+    return a.path.length - b.path.length;
+  };
+
+  // Best cost map for (stopId|lastRouteId) -> { interchanges, length }
+  const bestCostMap = new Map();
+  function bestKey(stopId, lastRouteId) {
+    return `${stopId}::${lastRouteId ?? 'null'}`;
+  }
+  function isBetterCost(newCost, oldCost) {
+    if (!oldCost) return true;
+    if (newCost.interchanges !== oldCost.interchanges) {
+      return newCost.interchanges < oldCost.interchanges;
+    }
+    return newCost.length < oldCost.length;
+  }
+
+  const heap = new MinHeap(cmp);
+  // node: { stopId, path: [{stopId, routeId, routeName}], lastRouteId, lastRouteName, interchanges }
+  heap.push({
+    stopId: sourceStopId,
+    path: [],
+    lastRouteId: null,
+    lastRouteName: null,
+    interchanges: 0,
+  });
+  bestCostMap.set(bestKey(sourceStopId, null), { interchanges: 0, length: 0 });
+
   const results = [];
 
-  // Initialize with source stop
-  queue.push({ 
-    stopId: sourceStopId, 
-    path: [], 
-    lastRoute: null 
-  });
+  while (heap.size() > 0 && results.length < maxRoutes) {
+    const node = heap.pop();
+    const { stopId, path, lastRouteId, lastRouteName, interchanges } = node;
 
-  while (queue.length > 0 && results.length<=maxRoutes ) {
-    const { stopId, path, lastRoute } = queue.pop();
-    
-    // Create visited key: stopId + lastRouteId
-    const visitedKey = `${stopId}-${lastRoute?.routeId || 'null'}`;
-    if (visited.has(visitedKey)) continue;
-    visited.add(visitedKey);
+    // safety
+    if (path.length > maxDepth) continue;
 
-    
-    const newPath = [...path, {
-      stopId,
-      routeId: lastRoute?.routeId || null,
-      routeName: lastRoute?.routeName || null
-    }];
+    // build newPath (append current stop with info about how we arrived)
+    const newPath = path.concat({ stopId, routeId: lastRouteId, routeName: lastRouteName });
 
-    
+    // if reached destination, format and add
     if (stopId === destinationStopId) {
-      
+      // set first stop's route info to the first real boarding route (so null -> route isn't counted)
       if (newPath.length > 1) {
         newPath[0].routeId = newPath[1].routeId;
         newPath[0].routeName = newPath[1].routeName;
       }
 
-      const interchanges = [];
-      
+      // Build interchanges array but DO NOT count boarding as a transfer (null -> route).
+      const interchangesArr = [];
       for (let i = 1; i < newPath.length; i++) {
-        if (newPath[i].routeId !== newPath[i-1].routeId) {
-          interchanges.push({
-            at_stop_id: newPath[i-1].stopId,
-            stop_name: stopMap[newPath[i-1].stopId].stop_name,
-            from_route_id: newPath[i-1].routeId,
-            from_route_name: newPath[i-1].routeName,
-            to_route_id: newPath[i].routeId,
-            to_route_name: newPath[i].routeName
+        const prev = newPath[i - 1];
+        const cur = newPath[i];
+        // only count a transfer if previous route was a real route (not null) and it changed
+        if (prev.routeId !== null && prev.routeId !== cur.routeId) {
+          interchangesArr.push({
+            at_stop_id: prev.stopId,
+            stop_name: stopMap[prev.stopId]?.stop_name ?? null,
+            from_route_id: prev.routeId,
+            from_route_name: prev.routeName,
+            to_route_id: cur.routeId,
+            to_route_name: cur.routeName,
           });
         }
       }
 
-      let interchangeNames = interchanges.map(i => i.to_route_name).join(" → ");
+      const interchangeNames = interchangesArr.length
+        ? interchangesArr.map((it) => it.to_route_name).join(' → ')
+        : '';
 
-      // boarding bus info
-      const boardingBus = newPath.length > 1 
-        ? { 
-            route_id: newPath[0].routeId, 
-            route_name: newPath[0].routeName 
-          } 
-        : null;
+      const boardingBus = newPath.length > 1 ? { route_id: newPath[0].routeId, route_name: newPath[0].routeName } : null;
 
-      const formattedPath = newPath.map(p => ({
+      const formattedPath = newPath.map((p) => ({
         stopId: p.stopId,
-        stop_name: stopMap[p.stopId].stop_name,
+        stop_name: stopMap[p.stopId]?.stop_name ?? null,
         routeId: p.routeId,
-        routeName: p.routeName
+        routeName: p.routeName,
       }));
 
+      // Push numeric interchange_count to make sorting unambiguous and consistent with search internal metric
       results.push({
-        is_direct_mode:false,
+        is_direct_mode: false,
         path: formattedPath,
         boarding_bus: boardingBus,
-        interchanges,
+        interchanges: interchangesArr,
+        interchange_count: interchanges, // numeric, matches node.interchanges used by comparator
         total_stops: newPath.length,
-        interchanges_names:interchangeNames
+        interchanges_names: interchangeNames,
       });
-      if(results.length == maxRoutes) break;
+
+      // do not expand neighbors from destination
       continue;
     }
 
-    // Explore neighbors
-    for (const neighbor of graph[stopId]) {
-      if (newPath.some(p => p.stopId === neighbor.stopId)) continue;
-      
-      queue.push({
-        stopId: neighbor.stopId,
-        path: newPath,
-        lastRoute: {
-          routeId: neighbor.routeId,
-          routeName: neighbor.routeName
-        }
-      });
+    // Expand neighbors
+    const neighbors = graph[stopId] || [];
+    for (const nb of neighbors) {
+      // avoid cycles on stops
+      if (newPath.some((p) => p.stopId === nb.stopId)) continue;
+
+      // compute new interchange count
+      // boarding first route (lastRouteId === null) should NOT increment interchanges
+      const willIncrement = lastRouteId !== null && nb.routeId !== lastRouteId ? 1 : 0;
+      const newInterchanges = interchanges + willIncrement;
+      const newLength = newPath.length + 1;
+
+      const key = bestKey(nb.stopId, nb.routeId);
+      const newCost = { interchanges: newInterchanges, length: newLength };
+      const oldCost = bestCostMap.get(key);
+
+      if (!oldCost || isBetterCost(newCost, oldCost)) {
+        bestCostMap.set(key, newCost);
+        heap.push({
+          stopId: nb.stopId,
+          path: newPath,
+          lastRouteId: nb.routeId,
+          lastRouteName: nb.routeName,
+          interchanges: newInterchanges,
+        });
+      }
     }
   }
+
+   // Build direct routes as single-route candidates (only include stops between source and destination)
   const directRoutesData = [];
-  directrouteIds.forEach(route=>{
-    let sourceStopIndex = route.stopIds.indexOf(sourceStopId);
-    let destinationStopIndex = route.stopIds.indexOf(destinationStopId);
-    const total_stops = Math.abs(destinationStopIndex-sourceStopIndex)+1;
-    const boardingBus = { 
-            route_id: route.route_id, 
-            route_name: route.route
-          };
 
-      const formattedPath = route.stopIds.map(p => ({
-        stopId: p,
-        stop_name: stopMap[p].stop_name,
-        routeId: route.route_id,
-        routeName: p.route
-      }));
+  // helper: find all indices of value in array
+  function findAllIndexes(arr, val) {
+    const res = [];
+    for (let i = 0; i < arr.length; i++) if (arr[i] === val) res.push(i);
+    return res;
+  }
 
-      directRoutesData.push({
-        is_direct_mode:true,
-        path: formattedPath,
-        boarding_bus: boardingBus,
-        interchanges:{},
-        total_stops: total_stops
-      });
+  for (const route of directRouteObjects) {
+    // normalize to numbers to avoid type mismatches
+    const stopIdsRaw = route.stopIds || [];
+    const stopIds = stopIdsRaw.map((x) => Number(x));
 
+    const sIdxs = findAllIndexes(stopIds, sourceStopId);
+    const dIdxs = findAllIndexes(stopIds, destinationStopId);
+    if (sIdxs.length === 0 || dIdxs.length === 0) continue;
+
+    // choose best pair of indices: minimal distance between source and dest
+    let best = null;
+    for (const si of sIdxs) {
+      for (const di of dIdxs) {
+        const dist = Math.abs(di - si);
+        const forward = si <= di;
+        // prefer the smallest dist; if tie prefer forward (optional)
+        if (best === null || dist < best.dist || (dist === best.dist && forward && !best.forward)) {
+          best = { si, di, dist, forward };
+        }
+      }
+    }
+    if (!best) continue;
+
+    const { si, di, forward } = best;
+    const slice = forward ? stopIds.slice(si, di + 1) : stopIds.slice(di, si + 1).reverse();
+
+    const formattedPath = slice.map((p) => ({
+      stopId: p,
+      stop_name: stopMap[p]?.stop_name ?? null,
+      routeId: route.route_id,
+      routeName: route.route,
+    }));
+
+    directRoutesData.push({
+      is_direct_mode: true,
+      path: formattedPath,
+      boarding_bus: { route_id: route.route_id, route_name: route.route },
+      interchanges: [],        // human-readable transfers (none for direct)
+      interchange_count: 0,    // numeric (used for sorting)
+      total_stops: formattedPath.length,
+      interchanges_names: '',
+    });
+  }
+   const combinedRaw = [...results, ...directRoutesData];
+
+  // dedupe by path stopIds + routeIds to avoid duplicate candidates
+  const seen = new Set();
+  const combined = [];
+  for (const r of combinedRaw) {
+    const pathKey = r.path.map((p) => `${p.stopId}:${p.routeId ?? 'null'}`).join('|');
+    if (seen.has(pathKey)) continue;
+    seen.add(pathKey);
+    combined.push(r);
+  }
+
+
+  combined.sort((a, b) => {
+    const aInter = typeof a.interchange_count === 'number' ? a.interchange_count : (Array.isArray(a.interchanges) ? a.interchanges.length : 0);
+    const bInter = typeof b.interchange_count === 'number' ? b.interchange_count : (Array.isArray(b.interchanges) ? b.interchanges.length : 0);
+    if (aInter !== bInter) return aInter - bInter;
+
+    const aStops = a.total_stops || (Array.isArray(a.path) ? a.path.length : Infinity);
+    const bStops = b.total_stops || (Array.isArray(b.path) ? b.path.length : Infinity);
+    if (aStops !== bStops) return aStops - bStops;
+
+    if ((a.is_direct_mode ? 1 : 0) !== (b.is_direct_mode ? 1 : 0)) return (b.is_direct_mode ? 1 : 0) - (a.is_direct_mode ? 1 : 0);
+
+    return 0;
   });
-  
-  directRoutesData.sort((a,b)=>a.total_stops-b.total_stops);
-  results.push(...directRoutesData.slice(0,3));
 
-  return { routes: results };
+  // limit and return
+  return { routes: combined.slice(0, maxRoutes) };
 }
+
 
 export const searchBusStopName = async (searchTerm) => {
   

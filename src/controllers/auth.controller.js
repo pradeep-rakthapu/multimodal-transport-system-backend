@@ -35,7 +35,8 @@ export const login = async (req, res, next) => {
 
 export const googleCallback = async (req, res) => {
     const token = generateToken(req.user);
-    const redirectUrl = `${process.env.FRONTEND_URL}/auth/success?token=${encodeURIComponent(token)}`;
+    console.log('generated token type:', typeof token);
+    const redirectUrl = `${process.env.FRONTEND_URL}/auth/success?token=${encodeURIComponent(token.accessToken)}`;
     res.redirect(redirectUrl);
 };
 
