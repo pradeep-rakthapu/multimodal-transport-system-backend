@@ -71,8 +71,7 @@ export const getMultiModalRoute = async (data) => {
           routingPreference: 'FEWER_TRANSFERS',
         },
         computeAlternativeRoutes: true,
-        languageCode: 'en',
-        departureTime,
+        languageCode: 'en'
       };
   
       const response = await axios.post(url, payload, {
